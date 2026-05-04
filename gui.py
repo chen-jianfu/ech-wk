@@ -24,74 +24,31 @@ if sys.platform == 'win32':
             windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE = 0
     except:
         pass
-    
-    # 高 DPI 支持 - 必须在导入 PyQt5 之前设置
-    # 使用 PROCESS_PER_MONITOR_DPI_AWARE_V2 (Windows 10 1703+)
-    # 这支持每个监视器 DPI 感知，并启用子窗口 DPI 缩放
-    try:
-        from ctypes import windll, ctypes
-        # 尝试使用最新的 DPI 感知 API (Windows 10 1703+)
-        try:
-            # PROCESS_PER_MONITOR_DPI_AWARE_V2 = 2
-            # 这个值支持每个监视器 DPI 感知和子窗口 DPI 缩放
-            windll.shcore.SetProcessDpiAwareness(2)
-        except (AttributeError, OSError):
-            # 如果 shcore 不可用，尝试旧版 API
-            try:
-                # PROCESS_PER_MONITOR_DPI_AWARE = 2 (旧版)
-                windll.shcore.SetProcessDpiAwareness(2)
-            except:
-                # 如果都失败，使用最基础的 DPI 感知
-                try:
-                    windll.user32.SetProcessDPIAware()
-                except:
-                    pass
-    except:
-        pass
 
 # 检查 PyQt5
 try:
-    from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                                  QHBoxLayout, QLabel, QLineEdit, QPushButton, 
-                                  QComboBox, QTextEdit, QCheckBox, QGroupBox, 
-                                  QMessageBox, QInputDialog, QSystemTrayIcon, QMenu, QAction)
+    from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                                  QHBoxLayout, QLabel, QLineEdit, QPushButton,
+                                  QComboBox, QTextEdit, QCheckBox, QGroupBox,
+                                  QMessageBox, QInputDialog, QSystemTrayIcon, QMenu, QAction,
+                                  QSizePolicy)
     from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
     from PyQt5.QtGui import QIcon, QTextCursor, QPixmap, QPainter, QColor, QFont
     HAS_PYQT = True
-    
-    # 注册 QTextCursor 类型以避免信号槽错误
+
     try:
         from PyQt5.QtCore import qRegisterMetaType
         qRegisterMetaType('QTextCursor')
     except (ImportError, AttributeError):
-        # qRegisterMetaType 在某些 PyQt5 版本中可能不可用，忽略
         pass
-    
-    # 高 DPI 支持 - 必须在创建 QApplication 之前设置
-    # PyQt5 5.6+ 支持高 DPI 缩放
-    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
-        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
-        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-    
-    # 设置环境变量以优化高 DPI 显示（Windows）
-    if sys.platform == 'win32':
-        try:
-            # 启用高 DPI 缩放
-            os.environ['QT_ENABLE_HIGHDPI_SCALING'] = '1'
-            # 设置缩放因子舍入策略（避免模糊）
-            os.environ['QT_SCALE_FACTOR_ROUNDING_POLICY'] = 'Round'
-            # 禁用自动缩放因子（让系统处理）
-            # os.environ['QT_AUTO_SCREEN_SCALE_FACTOR'] = '0'
-        except:
-            pass
+
 except ImportError:
     HAS_PYQT = False
     print("错误: 未安装 PyQt5")
     print("安装命令: pip3 install PyQt5")
     sys.exit(1)
 
-APP_VERSION = "1.4"
+APP_VERSION = "1.5"
 APP_TITLE = f"ECH Workers 客户端 v{APP_VERSION}"
 
 # 中国IP列表文件名（离线版本，放在程序目录）
@@ -401,11 +358,9 @@ class MainWindow(QMainWindow):
         """初始化界面"""
         self.setWindowTitle(APP_TITLE)
         
-        # Windows DPI 适配：根据系统 DPI 调整窗口大小
-        # PyQt5 的 AA_EnableHighDpiScaling 会自动处理缩放
-        # 我们设置逻辑像素大小，系统会自动转换为物理像素
-        base_width = 950
-        base_height = 800
+        # 窗口大小（适配 1440x900 及更小屏幕）
+        base_width = 600
+        base_height = 650
         
         # 获取可用屏幕区域（排除任务栏）
         try:
@@ -463,13 +418,13 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
-        layout.setSpacing(15)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(8)
+        layout.setContentsMargins(10, 10, 10, 10)
         
         # 服务器管理
         server_group = QGroupBox("服务器管理")
         server_layout = QHBoxLayout()
-        server_layout.setSpacing(10)
+        server_layout.setSpacing(8)
         server_label = QLabel("选择服务器:")
         server_label.setStyleSheet("font-weight: 600;")
         server_layout.addWidget(server_label)
@@ -498,7 +453,7 @@ class MainWindow(QMainWindow):
         # 核心配置
         core_group = QGroupBox("核心配置")
         core_layout = QVBoxLayout()
-        core_layout.setSpacing(12)
+        core_layout.setSpacing(8)
         self.server_edit = QLineEdit()
         self.server_edit.setPlaceholderText("例如: your-worker.workers.dev:443")
         core_layout.addWidget(self.create_label_edit("服务地址:", self.server_edit))
@@ -511,13 +466,13 @@ class MainWindow(QMainWindow):
         # 高级选项
         advanced_group = QGroupBox("高级选项 (可选)")
         advanced_layout = QVBoxLayout()
-        advanced_layout.setSpacing(12)
+        advanced_layout.setSpacing(8)
         self.token_edit = QLineEdit()
         self.token_edit.setPlaceholderText("身份验证令牌（可选）")
         self.token_edit.setEchoMode(QLineEdit.Password)
         advanced_layout.addWidget(self.create_label_edit("身份令牌:", self.token_edit))
         row1 = QHBoxLayout()
-        row1.setSpacing(10)
+        row1.setSpacing(8)
         self.ip_edit = QLineEdit()
         self.ip_edit.setPlaceholderText("例如: saas.sin.fan")
         row1.addWidget(self.create_label_edit("优选IP或域名:", self.ip_edit))
@@ -534,7 +489,7 @@ class MainWindow(QMainWindow):
         # 分流设置
         routing_group = QGroupBox("分流设置")
         routing_layout = QHBoxLayout()
-        routing_layout.setSpacing(10)
+        routing_layout.setSpacing(8)
         routing_label = QLabel("代理模式:")
         routing_label.setStyleSheet("font-weight: 600;")
         routing_layout.addWidget(routing_label)
@@ -551,7 +506,7 @@ class MainWindow(QMainWindow):
         # 控制按钮
         control_group = QGroupBox("控制")
         control_layout = QHBoxLayout()
-        control_layout.setSpacing(10)
+        control_layout.setSpacing(8)
         self.start_btn = QPushButton("启动代理")
         self.start_btn.clicked.connect(self.start_process)
         self.stop_btn = QPushButton("停止")
@@ -583,8 +538,10 @@ class MainWindow(QMainWindow):
         self.log_text.setReadOnly(True)
         # 使用等宽字体，更适合日志显示
         from PyQt5.QtGui import QFont
-        font = QFont("Consolas" if sys.platform == 'win32' else "Monaco" if sys.platform == 'darwin' else "DejaVu Sans Mono", 9)
+        font = QFont("Consolas" if sys.platform == 'win32' else "Monaco" if sys.platform == 'darwin' else "DejaVu Sans Mono", 8)
         self.log_text.setFont(font)
+        self.log_text.setMinimumHeight(200)
+        self.log_text.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         log_layout.addWidget(self.log_text)
         log_group.setLayout(log_layout)
         layout.addWidget(log_group)
@@ -656,13 +613,13 @@ class MainWindow(QMainWindow):
         /* 分组框样式 - 矩阵绿色边框 */
         QGroupBox {
             font-weight: 600;
-            font-size: 13px;
+            font-size: 12px;
             color: #00ff41;
             border: 2px solid #00ff41;
-            border-radius: 8px;
-            margin-top: 12px;
-            padding-top: 15px;
-            padding-bottom: 15px;
+            border-radius: 6px;
+            margin-top: 6px;
+            padding-top: 8px;
+            padding-bottom: 8px;
             background-color: #0a0a0a;
         }
         
@@ -678,16 +635,16 @@ class MainWindow(QMainWindow):
         /* 标签样式 - 绿色文字 */
         QLabel {
             color: #00ff41;
-            font-size: 13px;
-            min-width: 100px;
+            font-size: 12px;
+            min-width: 80px;
         }
         
         /* 输入框样式 - 深色背景，绿色边框 */
         QLineEdit {
             border: 2px solid #003311;
-            border-radius: 6px;
-            padding: 8px 12px;
-            font-size: 13px;
+            border-radius: 4px;
+            padding: 4px 8px;
+            font-size: 12px;
             background-color: #0a0a0a;
             color: #00ff41;
             selection-background-color: #00ff41;
@@ -708,12 +665,12 @@ class MainWindow(QMainWindow):
         /* 下拉框样式 */
         QComboBox {
             border: 2px solid #003311;
-            border-radius: 6px;
-            padding: 8px 12px;
-            font-size: 13px;
+            border-radius: 4px;
+            padding: 4px 8px;
+            font-size: 12px;
             background-color: #0a0a0a;
             color: #00ff41;
-            min-width: 150px;
+            min-width: 80px;
         }
         
         QComboBox:hover {
@@ -733,28 +690,28 @@ class MainWindow(QMainWindow):
         
         QComboBox::drop-down {
             border: none;
-            width: 30px;
-            border-top-right-radius: 6px;
-            border-bottom-right-radius: 6px;
+            width: 24px;
+            border-top-right-radius: 4px;
+            border-bottom-right-radius: 4px;
             background-color: transparent;
         }
         
         QComboBox::down-arrow {
             image: none;
-            border-left: 5px solid transparent;
-            border-right: 5px solid transparent;
-            border-top: 6px solid #00ff41;
+            border-left: 4px solid transparent;
+            border-right: 4px solid transparent;
+            border-top: 5px solid #00ff41;
             width: 0;
             height: 0;
         }
         
         QComboBox QAbstractItemView {
             border: 2px solid #00ff41;
-            border-radius: 6px;
+            border-radius: 4px;
             background-color: #0a0a0a;
             selection-background-color: #00ff41;
             selection-color: #000000;
-            padding: 4px;
+            padding: 2px;
             color: #00ff41;
         }
         
@@ -763,11 +720,11 @@ class MainWindow(QMainWindow):
             background-color: #003311;
             color: #00ff41;
             border: 2px solid #00ff41;
-            border-radius: 6px;
-            padding: 10px 20px;
-            font-size: 13px;
+            border-radius: 4px;
+            padding: 6px 14px;
+            font-size: 12px;
             font-weight: 600;
-            min-width: 100px;
+            min-width: 70px;
         }
         
         QPushButton:hover {
@@ -820,15 +777,15 @@ class MainWindow(QMainWindow):
         /* 复选框样式 */
         QCheckBox {
             color: #00ff41;
-            font-size: 13px;
-            spacing: 8px;
+            font-size: 12px;
+            spacing: 6px;
         }
         
         QCheckBox::indicator {
-            width: 20px;
-            height: 20px;
+            width: 16px;
+            height: 16px;
             border: 2px solid #00ff41;
-            border-radius: 4px;
+            border-radius: 3px;
             background-color: #0a0a0a;
         }
         
@@ -845,16 +802,16 @@ class MainWindow(QMainWindow):
         QCheckBox::indicator:checked::after {
             content: "✓";
             color: #000000;
-            font-size: 14px;
+            font-size: 12px;
             font-weight: bold;
         }
         
         /* 文本编辑框样式（日志） - 矩阵风格 */
         QTextEdit {
             border: 2px solid #00ff41;
-            border-radius: 6px;
-            padding: 12px;
-            font-size: 12px;
+            border-radius: 4px;
+            padding: 8px;
+            font-size: 11px;
             background-color: #000000;
             color: #00ff41;
             selection-background-color: #00ff41;
@@ -869,56 +826,56 @@ class MainWindow(QMainWindow):
         QScrollBar:vertical {
             border: none;
             background-color: #0a0a0a;
-            width: 12px;
+            width: 10px;
             margin: 0;
         }
         
-        QScrollBar::handle:vertical {
+        QScrollBar:handle:vertical {
             background-color: #003311;
             border: 1px solid #00ff41;
-            border-radius: 6px;
-            min-height: 20px;
+            border-radius: 5px;
+            min-height: 16px;
             margin: 2px;
         }
         
-        QScrollBar::handle:vertical:hover {
+        QScrollBar:handle:vertical:hover {
             background-color: #00ff41;
         }
         
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+        QScrollBar:add-line:vertical, QScrollBar::sub-line:vertical {
             height: 0;
         }
         
         QScrollBar:horizontal {
             border: none;
             background-color: #0a0a0a;
-            height: 12px;
+            height: 10px;
             margin: 0;
         }
         
-        QScrollBar::handle:horizontal {
+        QScrollBar:handle:horizontal {
             background-color: #003311;
             border: 1px solid #00ff41;
-            border-radius: 6px;
-            min-width: 20px;
+            border-radius: 5px;
+            min-width: 16px;
             margin: 2px;
         }
         
-        QScrollBar::handle:horizontal:hover {
+        QScrollBar:handle:horizontal:hover {
             background-color: #00ff41;
         }
         
-        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+        QScrollBar:add-line:horizontal, QScrollBar::sub-line:horizontal {
             width: 0;
         }
         
         /* 布局间距 */
         QVBoxLayout {
-            spacing: 10px;
+            spacing: 8px;
         }
         
         QHBoxLayout {
-            spacing: 10px;
+            spacing: 8px;
         }
         """
     
@@ -1158,7 +1115,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         label = QLabel(label_text)
-        label.setMinimumWidth(120)
+        label.setMinimumWidth(80)
         label.setStyleSheet("font-weight: 500;")
         layout.addWidget(label)
         layout.addWidget(edit_widget, 1)
