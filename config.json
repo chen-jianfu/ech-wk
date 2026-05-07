@@ -1,0 +1,21 @@
+{
+  "listen": "127.0.0.1:30000",
+  "server": "",
+  "serverIP": "cloudflare-ech.com",
+  "token": "",
+  "dns": "dns.alidns.com/dns-query",
+  "echDomain": "cloudflare-ech.com",
+  "routing": "bypass_cn",
+  "updateInterval": "24h",
+  "privateIP": [
+    "127.0.0.0/8",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16"
+  ],
+  "privateDomain": [
+    "localhost",
+    "local",
+    "lan"
+  ]
+}

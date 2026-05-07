@@ -6,10 +6,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -31,26 +34,47 @@ import (
 
 // ======================== 全局参数 ========================
 
+type Config struct {
+	Listen         string   `json:"listen"`
+	Server         string   `json:"server"`
+	ServerIP       string   `json:"serverIP"`
+	Token          string   `json:"token"`
+	DNS            string   `json:"dns"`
+	ECHDomain      string   `json:"echDomain"`
+	Routing        string   `json:"routing"`
+	UpdateInterval string   `json:"updateInterval"`
+	PrivateIP      []string `json:"privateIP"`
+	PrivateDomain  []string `json:"privateDomain"`
+}
+
 var (
-	listenAddr  string
-	serverAddr  string
-	serverIP    string
-	token       string
-	dnsServer   string
-	echDomain   string
-	routingMode string // 分流模式: "global", "bypass_cn", "none"
+	listenAddr     string
+	serverAddr     string
+	serverIP       string
+	token          string
+	dnsServer      string
+	echDomain      string
+	routingMode    string
+	updateInterval time.Duration
 
 	echListMu sync.RWMutex
 	echList   []byte
 
-	// 中国域名列表
 	chinaDomainsMu sync.RWMutex
 	chinaDomains   map[string]struct{}
+	domainFileHash string
 
-	// 中国 IP 列表
 	chinaIPsMu      sync.RWMutex
 	chinaIPv4Ranges []ipRangeV4
 	chinaIPv6Ranges []ipRangeV6
+	ipFileHash      string
+
+	privateIPsMu      sync.RWMutex
+	privateIPv4Ranges []ipRangeV4
+	privateIPv6Ranges []ipRangeV6
+
+	privateDomainsMu sync.RWMutex
+	privateDomains   map[string]struct{}
 )
 
 type ipRangeV4 struct {
@@ -71,13 +95,71 @@ func init() {
 	flag.StringVar(&dnsServer, "dns", "dns.alidns.com/dns-query", "ECH 查询 DoH 服务器")
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH 查询域名")
 	flag.StringVar(&routingMode, "routing", "global", "分流模式: global(全局代理), bypass_cn(跳过中国大陆域名和IP), none(不改变代理)")
+	flag.DurationVar(&updateInterval, "update", 24*time.Hour, "自动更新路由规则的时间间隔 (设为 0 禁用)")
+	flag.StringVar(&configPath, "config", "config.json", "配置文件路径")
+}
+
+var configPath string
+
+func loadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("读取配置文件失败: %w", err)
+	}
+
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("解析配置文件失败: %w", err)
+	}
+
+return &cfg, nil
 }
 
 func main() {
 	flag.Parse()
 
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		log.Printf("[配置] 加载配置文件失败: %v", err)
+	}
+
+	if cfg != nil {
+		log.Printf("[配置] 已加载配置文件: %s", configPath)
+		if listenAddr == "127.0.0.1:30000" && cfg.Listen != "" {
+			listenAddr = cfg.Listen
+		}
+		if serverAddr == "" && cfg.Server != "" {
+			serverAddr = cfg.Server
+		}
+		if serverIP == "" && cfg.ServerIP != "" {
+			serverIP = cfg.ServerIP
+		}
+		if token == "" && cfg.Token != "" {
+			token = cfg.Token
+		}
+		if dnsServer == "dns.alidns.com/dns-query" && cfg.DNS != "" {
+			dnsServer = cfg.DNS
+		}
+		if echDomain == "cloudflare-ech.com" && cfg.ECHDomain != "" {
+			echDomain = cfg.ECHDomain
+		}
+		if routingMode == "global" && cfg.Routing != "" {
+			routingMode = cfg.Routing
+		}
+		if updateInterval == 24*time.Hour && cfg.UpdateInterval != "" {
+			if dur, err := time.ParseDuration(cfg.UpdateInterval); err == nil {
+				updateInterval = dur
+			}
+		}
+	}
+
+	loadPrivateRules(cfg)
+
 	if serverAddr == "" {
-		log.Fatal("必须指定服务端地址 -f\n\n示例:\n  ./client -l 127.0.0.1:1080 -f your-worker.workers.dev:443 -token your-token")
+		log.Fatal("必须指定服务端地址 -f 或在配置文件中指定\n\n示例:\n  ./client -l 127.0.0.1:1080 -f your-worker.workers.dev:443 -token your-token\n\n配置文件示例 (config.json):\n{\n  \"listen\": \"127.0.0.1:30000\",\n  \"server\": \"your-worker.workers.dev:443\",\n  \"serverIP\": \"\",\n  \"token\": \"your-token\",\n  \"dns\": \"dns.alidns.com/dns-query\",\n  \"echDomain\": \"cloudflare-ech.com\",\n  \"routing\": \"global\",\n  \"updateInterval\": \"24h\"\n}")
 	}
 
 	log.Printf("[启动] 正在获取 ECH 配置...")
@@ -89,27 +171,12 @@ func main() {
 	if routingMode == "bypass_cn" {
 		log.Printf("[启动] 分流模式: 跳过中国大陆，正在加载路由列表...")
 
-		// 加载域名列表
-		domainCount := 0
-		if err := loadChinaDomainList(); err != nil {
-			log.Printf("[警告] 加载中国域名列表失败: %v", err)
-		} else {
-			chinaDomainsMu.RLock()
-			domainCount = len(chinaDomains)
-			chinaDomainsMu.RUnlock()
-		}
+		// 初始化加载规则 (false 表示优先从本地读取)
+		updateDomainList(false)
+		updateIPList(false)
 
-		// 加载 IP 列表
-		ipCount := 0
-		if err := loadChinaIPList(); err != nil {
-			log.Printf("[警告] 加载中国 IP 列表失败: %v", err)
-		} else {
-			chinaIPsMu.RLock()
-			ipCount = len(chinaIPv4Ranges) + len(chinaIPv6Ranges)
-			chinaIPsMu.RUnlock()
-		}
-
-		log.Printf("[启动] 分流规则加载完毕: %d 个域名规则, %d 个 IP 规则段", domainCount, ipCount)
+		// 启动后台自动更新守护协程
+		startAutoUpdater()
 
 	} else if routingMode == "global" {
 		log.Printf("[启动] 分流模式: 全局代理")
@@ -119,63 +186,79 @@ func main() {
 		log.Printf("[警告] 未知的分流模式: %s，使用默认模式 global", routingMode)
 		routingMode = "global"
 	}
-
 	runProxyServer(listenAddr)
 }
 
-// ======================== 分流与工具函数 ========================
+// ======================== 数据更新与工具函数 ========================
 
-func downloadFile(url, filePath string) error {
-	log.Printf("[下载] 正在下载: %s", url)
+// calculateMD5 计算数据的 MD5 哈希
+func calculateMD5(data []byte) string {
+	hash := md5.Sum(data)
+	return hex.EncodeToString(hash[:])
+}
 
+// downloadData 纯内存下载数据
+func downloadData(url string) ([]byte, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		return fmt.Errorf("下载失败: %w", err)
+		return nil, fmt.Errorf("下载失败: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("下载失败: HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("HTTP 状态码异常: %d", resp.StatusCode)
 	}
 
-	content, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("读取下载内容失败: %w", err)
-	}
-
-	if err := os.WriteFile(filePath, content, 0644); err != nil {
-		return fmt.Errorf("保存文件失败: %w", err)
-	}
-
-	log.Printf("[下载] 已保存到: %s", filePath)
-	return nil
+	return io.ReadAll(resp.Body)
 }
 
-func loadChinaDomainList() error {
+// updateDomainList 热更新域名列表
+func updateDomainList(forceDownload bool) {
 	exePath, _ := os.Executable()
-	domainListFile := filepath.Join(filepath.Dir(exePath), "chn_domain.txt")
+	filePath := filepath.Join(filepath.Dir(exePath), "chn_domain.txt")
 
-	if _, err := os.Stat(domainListFile); os.IsNotExist(err) {
-		domainListFile = "chn_domain.txt"
-	}
+	var data []byte
+	var err error
 
-	if info, err := os.Stat(domainListFile); os.IsNotExist(err) || info.Size() == 0 {
-		log.Printf("[加载] 域名列表不存在，将自动下载")
+	info, statErr := os.Stat(filePath)
+	isLocalMissing := os.IsNotExist(statErr) || info.Size() == 0
+
+	if forceDownload || isLocalMissing {
+		if isLocalMissing && !forceDownload {
+			log.Printf("[加载-域名] 本地列表缺失，准备从远端下载...")
+		} else if forceDownload {
+			log.Printf("[更新-域名] 开始检查远端规则更新...")
+		}
+		
 		url := "https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf"
-		if err := downloadFile(url, domainListFile); err != nil {
-			return err
+		data, err = downloadData(url)
+		if err != nil {
+			log.Printf("[警告-域名] 获取远端规则失败: %v", err)
+			return
+		}
+	} else {
+		data, err = os.ReadFile(filePath)
+		if err != nil {
+			log.Printf("[警告-域名] 读取本地文件失败: %v", err)
+			return
 		}
 	}
 
-	file, err := os.Open(domainListFile)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
+	// 1. 内容 Hash 校验
+	newHash := calculateMD5(data)
+	chinaDomainsMu.RLock()
+	currentHash := domainFileHash
+	chinaDomainsMu.RUnlock()
 
-	domains := make(map[string]struct{})
-	scanner := bufio.NewScanner(file)
+	if forceDownload && newHash == currentHash {
+		log.Printf("[更新-域名] 远端规则内容无变化 (MD5匹配)，无需更新")
+		return
+	}
+
+	// 2. 解析数据到全新 Map
+	newDomains := make(map[string]struct{})
+	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -184,46 +267,89 @@ func loadChinaDomainList() error {
 		if strings.HasPrefix(line, "server=/") {
 			parts := strings.Split(line, "/")
 			if len(parts) >= 3 {
-				domains[strings.ToLower(parts[1])] = struct{}{}
+				newDomains[strings.ToLower(parts[1])] = struct{}{}
 			}
 		} else {
-			domains[strings.ToLower(line)] = struct{}{}
+			newDomains[strings.ToLower(line)] = struct{}{}
 		}
 	}
 
+	// 3. 容错校验
+	if len(newDomains) == 0 {
+		log.Printf("[警告-域名] 解析到的规则数为 0，可能数据损坏，拒绝替换现有规则")
+		return
+	}
+
+	// 4. 写盘保存 (如果是新下载的数据)
+	if forceDownload || isLocalMissing {
+		if err := os.WriteFile(filePath, data, 0644); err != nil {
+			log.Printf("[警告-域名] 保存到本地缓存文件失败: %v", err)
+		} else if isLocalMissing {
+			log.Printf("[加载-域名] 已成功下载并保存至: %s", filePath)
+		}
+	}
+
+	// 5. 无锁热替换 (瞬间完成)
 	chinaDomainsMu.Lock()
-	chinaDomains = domains
+	chinaDomains = newDomains
+	domainFileHash = newHash
 	chinaDomainsMu.Unlock()
-	return nil
+
+	if forceDownload {
+		log.Printf("[更新-域名] 规则热更新成功！最新规则数: %d 条", len(newDomains))
+	} else {
+		log.Printf("[启动-域名] 规则加载完毕: %d 条", len(newDomains))
+	}
 }
 
-func loadChinaIPList() error {
+// updateIPList 热更新 IP 列表
+func updateIPList(forceDownload bool) {
 	exePath, _ := os.Executable()
-	ipListFile := filepath.Join(filepath.Dir(exePath), "chn_ip.txt")
+	filePath := filepath.Join(filepath.Dir(exePath), "chn_ip.txt")
 
-	if _, err := os.Stat(ipListFile); os.IsNotExist(err) {
-		ipListFile = "chn_ip.txt"
-	}
+	var data []byte
+	var err error
 
-	if info, err := os.Stat(ipListFile); os.IsNotExist(err) || info.Size() == 0 {
-		log.Printf("[加载] IP 列表不存在，将自动下载")
-		// 使用包含了 IPv4 和 IPv6 CIDR 的综合中国 IP 列表
+	info, statErr := os.Stat(filePath)
+	isLocalMissing := os.IsNotExist(statErr) || info.Size() == 0
+
+	if forceDownload || isLocalMissing {
+		if isLocalMissing && !forceDownload {
+			log.Printf("[加载-IP] 本地列表缺失，准备从远端下载...")
+		} else if forceDownload {
+			log.Printf("[更新-IP] 开始检查远端规则更新...")
+		}
+
 		url := "https://raw.githubusercontent.com/PaPerseller/chn-iplist/refs/heads/master/chnroute.txt"
-		if err := downloadFile(url, ipListFile); err != nil {
-			return err
+		data, err = downloadData(url)
+		if err != nil {
+			log.Printf("[警告-IP] 获取远端规则失败: %v", err)
+			return
+		}
+	} else {
+		data, err = os.ReadFile(filePath)
+		if err != nil {
+			log.Printf("[警告-IP] 读取本地文件失败: %v", err)
+			return
 		}
 	}
 
-	file, err := os.Open(ipListFile)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
+	// 1. 内容 Hash 校验
+	newHash := calculateMD5(data)
+	chinaIPsMu.RLock()
+	currentHash := ipFileHash
+	chinaIPsMu.RUnlock()
 
+	if forceDownload && newHash == currentHash {
+		log.Printf("[更新-IP] 远端规则内容无变化 (MD5匹配)，无需更新")
+		return
+	}
+
+	// 2. 解析数据到全新 Slice
 	var v4Ranges []ipRangeV4
 	var v6Ranges []ipRangeV6
 
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -232,17 +358,15 @@ func loadChinaIPList() error {
 
 		ip, ipnet, err := net.ParseCIDR(line)
 		if err != nil {
-			continue // 如果不是合法的 CIDR 格式，则跳过
+			continue
 		}
 
 		if ip4 := ip.To4(); ip4 != nil {
-			// 处理 IPv4
 			start := binary.BigEndian.Uint32(ip4)
 			mask := binary.BigEndian.Uint32(ipnet.Mask)
 			end := start | (^mask)
 			v4Ranges = append(v4Ranges, ipRangeV4{start: start, end: end})
 		} else {
-			// 处理 IPv6
 			var start, end [16]byte
 			mask := ipnet.Mask
 			ip16 := ip.To16()
@@ -254,15 +378,159 @@ func loadChinaIPList() error {
 		}
 	}
 
-	// 排序以便进行二分查找
+	// 3. 容错校验
+	if len(v4Ranges)+len(v6Ranges) == 0 {
+		log.Printf("[警告-IP] 解析到的规则数为 0，可能数据损坏，拒绝替换现有规则")
+		return
+	}
+
+	// 排序以便二分查找
 	sort.Slice(v4Ranges, func(i, j int) bool { return v4Ranges[i].start < v4Ranges[j].start })
 	sort.Slice(v6Ranges, func(i, j int) bool { return bytes.Compare(v6Ranges[i].start[:], v6Ranges[j].start[:]) < 0 })
 
+	// 4. 写盘保存
+	if forceDownload || isLocalMissing {
+		if err := os.WriteFile(filePath, data, 0644); err != nil {
+			log.Printf("[警告-IP] 保存到本地缓存文件失败: %v", err)
+		} else if isLocalMissing {
+			log.Printf("[加载-IP] 已成功下载并保存至: %s", filePath)
+		}
+	}
+
+	// 5. 无锁热替换 (瞬间完成)
 	chinaIPsMu.Lock()
 	chinaIPv4Ranges = v4Ranges
 	chinaIPv6Ranges = v6Ranges
+	ipFileHash = newHash
 	chinaIPsMu.Unlock()
-	return nil
+
+	if forceDownload {
+		log.Printf("[更新-IP] 规则热更新成功！最新 IPv4: %d 段, IPv6: %d 段", len(v4Ranges), len(v6Ranges))
+	} else {
+		log.Printf("[启动-IP] 规则加载完毕: IPv4: %d 段, IPv6: %d 段", len(v4Ranges), len(v6Ranges))
+	}
+}
+
+// startAutoUpdater 启动后台自动更新守护进程
+func startAutoUpdater() {
+	if updateInterval <= 0 {
+		log.Printf("[守护进程] 自动更新功能已禁用 (-update 0)")
+		return
+	}
+
+	log.Printf("[守护进程] 自动热更新已启动，更新频率: %v", updateInterval)
+	ticker := time.NewTicker(updateInterval)
+
+	go func() {
+		for range ticker.C {
+			log.Printf("==============================================")
+			log.Printf("[自动更新] 触发定时任务，正在检查远端路由库...")
+			updateDomainList(true) // true 强制从远端拉取并校验
+			updateIPList(true)
+			log.Printf("==============================================")
+		}
+	}()
+}
+
+func loadPrivateRules(cfg *Config) {
+	privateIPsMu.Lock()
+	defer privateIPsMu.Unlock()
+
+	privateDomainsMu.Lock()
+	defer privateDomainsMu.Unlock()
+
+	if cfg == nil || (len(cfg.PrivateIP) == 0 && len(cfg.PrivateDomain) == 0) {
+		return
+	}
+
+	var v4Ranges []ipRangeV4
+	var v6Ranges []ipRangeV6
+
+	for _, cidr := range cfg.PrivateIP {
+		ip, ipnet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue
+		}
+
+		if ip4 := ip.To4(); ip4 != nil {
+			start := binary.BigEndian.Uint32(ip4)
+			mask := binary.BigEndian.Uint32(ipnet.Mask)
+			end := start | (^mask)
+			v4Ranges = append(v4Ranges, ipRangeV4{start: start, end: end})
+		} else {
+			var start, end [16]byte
+			mask := ipnet.Mask
+			ip16 := ip.To16()
+			for i := 0; i < 16; i++ {
+				start[i] = ip16[i] & mask[i]
+				end[i] = start[i] | ^mask[i]
+			}
+			v6Ranges = append(v6Ranges, ipRangeV6{start: start, end: end})
+		}
+	}
+
+	sort.Slice(v4Ranges, func(i, j int) bool { return v4Ranges[i].start < v4Ranges[j].start })
+	sort.Slice(v6Ranges, func(i, j int) bool { return bytes.Compare(v6Ranges[i].start[:], v6Ranges[j].start[:]) < 0 })
+
+	privateIPv4Ranges = v4Ranges
+	privateIPv6Ranges = v6Ranges
+
+	domains := make(map[string]struct{})
+	for _, d := range cfg.PrivateDomain {
+		domains[strings.ToLower(d)] = struct{}{}
+	}
+	privateDomains = domains
+
+	log.Printf("[私有规则] 已加载: IPv4/IPv6段 %d, 域名 %d", len(v4Ranges)+len(v6Ranges), len(domains))
+}
+
+func isPrivateIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+
+	privateIPsMu.RLock()
+	defer privateIPsMu.RUnlock()
+
+	if ip4 := ip.To4(); ip4 != nil {
+		val := binary.BigEndian.Uint32(ip4)
+		idx := sort.Search(len(privateIPv4Ranges), func(i int) bool {
+			return privateIPv4Ranges[i].end >= val
+		})
+		if idx < len(privateIPv4Ranges) && privateIPv4Ranges[idx].start <= val {
+			return true
+		}
+		return false
+	}
+
+	ip16 := ip.To16()
+	idx := sort.Search(len(privateIPv6Ranges), func(i int) bool {
+		return bytes.Compare(privateIPv6Ranges[i].end[:], ip16) >= 0
+	})
+	if idx < len(privateIPv6Ranges) && bytes.Compare(privateIPv6Ranges[idx].start[:], ip16) <= 0 {
+		return true
+	}
+	return false
+}
+
+func isPrivateDomain(domain string) bool {
+	domain = strings.ToLower(domain)
+	privateDomainsMu.RLock()
+	defer privateDomainsMu.RUnlock()
+
+	if _, exists := privateDomains[domain]; exists {
+		return true
+	}
+
+	parts := strings.Split(domain, ".")
+	for i := 0; i < len(parts); i++ {
+		subDomain := strings.Join(parts[i:], ".")
+		if _, exists := privateDomains[subDomain]; exists {
+			return true
+		}
+	}
+	return false
 }
 
 func isChinaDomain(domain string) bool {
@@ -313,6 +581,16 @@ func isChinaIP(ipStr string) bool {
 }
 
 func shouldBypassProxy(targetHost string) bool {
+	if ip := net.ParseIP(targetHost); ip != nil {
+		if isPrivateIP(targetHost) {
+			return true
+		}
+	} else {
+		if isPrivateDomain(targetHost) {
+			return true
+		}
+	}
+
 	if routingMode == "none" {
 		return true 
 	}
@@ -324,18 +602,13 @@ func shouldBypassProxy(targetHost string) bool {
 		// 1. 【IP兜底机制】：如果目标直接就是一个 IP 地址
 		if ip := net.ParseIP(targetHost); ip != nil {
 			isCN := isChinaIP(targetHost)
-			if isCN {
-				log.Printf("[路由-IP匹配] 识别到纯 IP 请求: %s -> 命中中国 IP 段，放行直连", targetHost)
-			} else {
-				log.Printf("[路由-IP匹配] 识别到纯 IP 请求: %s -> 属于海外/未知 IP，强走代理", targetHost)
-			}
 			return isCN
 		}
 
 		// 2. 如果是域名，判断是否是中国域名
 		if isChinaDomain(targetHost) {
 			// 如果你也想看域名的匹配日志，可以把下面这行注释打开
-			log.Printf("[路由-域名匹配] %s -> 命中中国域名，放行直连", targetHost)
+			//log.Printf("[路由-域名匹配] %s -> 命中中国域名，放行直连", targetHost)
 			return true 
 		}
 
