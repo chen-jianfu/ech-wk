@@ -37,7 +37,7 @@ import (
 type Config struct {
 	Listen         string   `json:"listen"`
 	Server         string   `json:"server"`
-	ServerIP       string   `json:"serverIP"`
+	ServerIP       []string `json:"serverIP"`
 	Token          string   `json:"token"`
 	DNS            string   `json:"dns"`
 	ECHDomain      string   `json:"echDomain"`
@@ -50,7 +50,8 @@ type Config struct {
 var (
 	listenAddr     string
 	serverAddr     string
-	serverIP       string
+	serverIPs      []string
+	currentIPIndex int
 	token          string
 	dnsServer      string
 	echDomain      string
@@ -90,7 +91,7 @@ type ipRangeV6 struct {
 func init() {
 	flag.StringVar(&listenAddr, "l", "127.0.0.1:30000", "代理监听地址 (支持 SOCKS5 和 HTTP)")
 	flag.StringVar(&serverAddr, "f", "", "服务端地址 (格式: x.x.workers.dev:443)")
-	flag.StringVar(&serverIP, "ip", "", "指定服务端 IP（绕过 DNS 解析）")
+	flag.StringVar(&cliServerIP, "ip", "", "指定服务端 IP（绕过 DNS 解析）")
 	flag.StringVar(&token, "token", "", "身份验证令牌")
 	flag.StringVar(&dnsServer, "dns", "dns.alidns.com/dns-query", "ECH 查询 DoH 服务器")
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH 查询域名")
@@ -100,6 +101,8 @@ func init() {
 }
 
 var configPath string
+
+var cliServerIP string
 
 func loadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -134,8 +137,8 @@ func main() {
 		if serverAddr == "" && cfg.Server != "" {
 			serverAddr = cfg.Server
 		}
-		if serverIP == "" && cfg.ServerIP != "" {
-			serverIP = cfg.ServerIP
+		if len(serverIPs) == 0 && len(cfg.ServerIP) > 0 {
+			serverIPs = cfg.ServerIP
 		}
 		if token == "" && cfg.Token != "" {
 			token = cfg.Token
@@ -154,6 +157,14 @@ func main() {
 				updateInterval = dur
 			}
 		}
+	}
+
+	if cliServerIP != "" {
+		serverIPs = []string{cliServerIP}
+	}
+
+	if len(serverIPs) > 0 {
+		log.Printf("[配置] 服务器 IP 列表: %v (当前: %s)", serverIPs, getCurrentServerIP())
 	}
 
 	loadPrivateRules(cfg)
@@ -909,7 +920,8 @@ func queryDoHForProxy(dnsQuery []byte) ([]byte, error) {
 		TLSClientConfig: tlsCfg,
 	}
 
-	if serverIP != "" {
+	currentIP := getCurrentServerIP()
+	if currentIP != "" {
 		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			_, port, err := net.SplitHostPort(addr)
 			if err != nil {
@@ -918,7 +930,7 @@ func queryDoHForProxy(dnsQuery []byte) ([]byte, error) {
 			dialer := &net.Dialer{
 				Timeout: 10 * time.Second,
 			}
-			return dialer.DialContext(ctx, network, net.JoinHostPort(serverIP, port))
+			return dialer.DialContext(ctx, network, net.JoinHostPort(currentIP, port))
 		}
 	}
 
@@ -973,11 +985,15 @@ func dialWebSocketWithECH(maxRetries int) (*websocket.Conn, error) {
 	}
 
 	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
+	totalIPs := len(serverIPs)
+	if totalIPs == 0 {
+		totalIPs = 1
+	}
 
-	for attempt := 1; attempt <= maxRetries; attempt++ {
+	for attempt := 1; attempt <= maxRetries*totalIPs; attempt++ {
 		echBytes, echErr := getECHList()
 		if echErr != nil {
-			if attempt < maxRetries {
+			if attempt < maxRetries*totalIPs {
 				refreshECH()
 				continue
 			}
@@ -1000,22 +1016,29 @@ func dialWebSocketWithECH(maxRetries int) (*websocket.Conn, error) {
 			HandshakeTimeout: 10 * time.Second,
 		}
 
-		if serverIP != "" {
+		currentIP := getCurrentServerIP()
+		if currentIP != "" {
 			dialer.NetDial = func(network, address string) (net.Conn, error) {
 				_, port, err := net.SplitHostPort(address)
 				if err != nil {
 					return nil, err
 				}
-				return net.DialTimeout(network, net.JoinHostPort(serverIP, port), 10*time.Second)
+				return net.DialTimeout(network, net.JoinHostPort(currentIP, port), 10*time.Second)
 			}
 		}
 
 		wsConn, _, dialErr := dialer.Dial(wsURL, nil)
 		if dialErr != nil {
-			if strings.Contains(dialErr.Error(), "ECH") && attempt < maxRetries {
-				log.Printf("[ECH] 连接失败，尝试刷新配置 (%d/%d)", attempt, maxRetries)
+			log.Printf("[调试] dialErr 类型: %T, 错误信息: %v", dialErr, dialErr)
+			if strings.Contains(dialErr.Error(), "ECH") && attempt < maxRetries*totalIPs {
+				log.Printf("[ECH] 连接失败，尝试刷新配置 (%d/%d)", attempt, maxRetries*totalIPs)
 				refreshECH()
 				time.Sleep(time.Second)
+				continue
+			}
+			if totalIPs > 1 && attempt < maxRetries*totalIPs {
+				log.Printf("[服务器] 连接失败 IP %s，尝试切换到下一个 (%d/%d)", currentIP, attempt, maxRetries*totalIPs)
+				switchToNextServerIP()
 				continue
 			}
 			return nil, dialErr
@@ -1038,8 +1061,9 @@ func runProxyServer(addr string) {
 
 	log.Printf("[代理] 服务器启动: %s (支持 SOCKS5 和 HTTP)", addr)
 	log.Printf("[代理] 后端服务器: %s", serverAddr)
-	if serverIP != "" {
-		log.Printf("[代理] 使用固定 IP: %s", serverIP)
+	if len(serverIPs) > 0 {
+		log.Printf("[代理] 服务器 IP 列表: %v", serverIPs)
+		log.Printf("[代理] 当前使用 IP: %s", getCurrentServerIP())
 	}
 
 	for {
@@ -1641,6 +1665,31 @@ func sendSuccessResponse(conn net.Conn, mode int) error {
 		return nil
 	}
 	return nil
+}
+
+func getCurrentServerIP() string {
+	if len(serverIPs) == 0 {
+		return ""
+	}
+	return serverIPs[currentIPIndex%len(serverIPs)]
+}
+
+func getAllServerIPs() []string {
+	return serverIPs
+}
+
+func switchToNextServerIP() {
+	if len(serverIPs) > 1 {
+		currentIPIndex = (currentIPIndex + 1) % len(serverIPs)
+		log.Printf("[服务器切换] 切换到下一个 IP: %s", getCurrentServerIP())
+	}
+}
+
+func resetServerIPToFirst() {
+	if currentIPIndex != 0 {
+		currentIPIndex = 0
+		log.Printf("[服务器重置] 重置到第一个 IP: %s", getCurrentServerIP())
+	}
 }
 
 // --- END OF FILE ---
