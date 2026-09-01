@@ -5,6 +5,46 @@ const CF_FALLBACK_IPS = ['ProxyIP.CMLiussss.net'];// cm维护
 // 复用 TextEncoder，避免重复创建
 const encoder = new TextEncoder();
 
+// 伪装页面：nginx 默认欢迎页
+async function nginx() {
+    return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <title>Welcome to nginx!</title>
+    <style>
+        body {
+            width: 35em;
+            margin: 0 auto;
+            font-family: Tahoma, Verdana, Arial, sans-serif;
+        }
+    </style>
+    </head>
+    <body>
+    <h1>Welcome to nginx!</h1>
+    <p>If you see this page, the nginx web server is successfully installed and
+    working. Further configuration is required.</p>
+
+    <p>For online documentation and support please refer to
+    <a href="http://nginx.org/">nginx.org</a>.<br/>
+    Commercial support is available at
+    <a href="http://nginx.com/">nginx.com</a>.</p>
+
+    <p><em>Thank you for using nginx.</em></p>
+    </body>
+    </html>
+    `
+}
+
+// 统一伪装响应：所有非法请求返回 200 + nginx 页面
+async function disguiseResponse() {
+    const html = await nginx();
+    return new Response(html, {
+        status: 200,
+        headers: { 'Content-Type': 'text/html; charset=utf-8' }
+    });
+}
+
 import { connect } from 'cloudflare:sockets';
 
 // 传输参数，取自 GrainTCP优化.js
@@ -67,14 +107,14 @@ export default {
       const token = '';
       const upgradeHeader = request.headers.get('Upgrade');
 
+      // 非 WebSocket 请求 → 伪装响应
       if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
-        return new URL(request.url).pathname === '/'
-          ? new Response('WebSocket Proxy Server', { status: 200 })
-          : new Response('Expected WebSocket', { status: 426 });
+        return disguiseResponse();
       }
 
+      // Token 验证失败 → 伪装响应（不返回 401）
       if (token && request.headers.get('Sec-WebSocket-Protocol') !== token) {
-        return new Response('Unauthorized', { status: 401 });
+        return disguiseResponse();
       }
 
       const [client, server] = Object.values(new WebSocketPair());
@@ -96,7 +136,8 @@ export default {
       return new Response(null, responseInit);
 
     } catch (err) {
-      return new Response(err.toString(), { status: 500 });
+      // 任何异常 → 伪装响应（不返回 500）
+      return disguiseResponse();
     }
   },
 };
