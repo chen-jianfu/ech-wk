@@ -39,6 +39,9 @@ var (
 	echDomain   string
 	routingMode string // 分流模式: "global", "bypass_cn", "none"
 
+	enableECHFlag string // -enable_ech 原始参数
+	enableECH     bool   // 是否启用 ECH（默认 true）
+
 	echListMu  sync.RWMutex
 	echList    []byte
 	echVersion uint64 // ECH 配置版本号，用于判断 DoH 客户端是否需要重建
@@ -50,6 +53,10 @@ var (
 	// 中国IP列表（IPv6）
 	chinaIPV6RangesMu sync.RWMutex
 	chinaIPV6Ranges   []ipRangeV6
+
+	// 中国域名列表（域名分流）
+	chinaDomainsMu sync.RWMutex
+	chinaDomains   map[string]struct{}
 )
 
 // ======================== 性能优化全局缓存 ========================
@@ -67,18 +74,6 @@ var (
 	dohClientValue atomic.Value // *dohClientBox
 )
 
-// 分流 DNS 缓存
-const (
-	dnsCacheTTL    = 5 * time.Minute
-	dnsCacheNegTTL = 30 * time.Second
-	dnsCacheMaxLen = 4096
-)
-
-var (
-	dnsCacheMu sync.RWMutex
-	dnsCache   = make(map[string]dnsCacheEntry)
-)
-
 // ipRange 表示一个IPv4 IP范围
 type ipRange struct {
 	start uint32
@@ -91,46 +86,6 @@ type ipRangeV6 struct {
 	end   [16]byte
 }
 
-// dnsCacheEntry 分流判断用的 DNS 解析缓存条目
-type dnsCacheEntry struct {
-	ips      []net.IP // 解析结果，nil 表示负缓存（解析失败）
-	expireAt time.Time
-}
-
-// lookupIPWithCache 带缓存的域名解析，避免每个请求都同步查询 DNS
-func lookupIPWithCache(host string) []net.IP {
-	now := time.Now()
-
-	dnsCacheMu.RLock()
-	if e, ok := dnsCache[host]; ok && now.Before(e.expireAt) {
-		dnsCacheMu.RUnlock()
-		return e.ips
-	}
-	dnsCacheMu.RUnlock()
-
-	entry := dnsCacheEntry{expireAt: now.Add(dnsCacheNegTTL)}
-	if ips, err := net.LookupIP(host); err == nil && len(ips) > 0 {
-		entry.ips = ips
-		entry.expireAt = now.Add(dnsCacheTTL)
-	}
-
-	dnsCacheMu.Lock()
-	if len(dnsCache) >= dnsCacheMaxLen {
-		for k, v := range dnsCache {
-			if now.After(v.expireAt) {
-				delete(dnsCache, k)
-			}
-		}
-		if len(dnsCache) >= dnsCacheMaxLen {
-			dnsCache = make(map[string]dnsCacheEntry)
-		}
-	}
-	dnsCache[host] = entry
-	dnsCacheMu.Unlock()
-
-	return entry.ips
-}
-
 func init() {
 	flag.StringVar(&listenAddr, "l", "127.0.0.1:30000", "代理监听地址 (支持 SOCKS5 和 HTTP)")
 	flag.StringVar(&serverAddr, "f", "", "服务端地址 (格式: x.x.workers.dev:443)")
@@ -138,24 +93,55 @@ func init() {
 	flag.StringVar(&token, "token", "", "身份验证令牌")
 	flag.StringVar(&dnsServer, "dns", "dns.alidns.com/dns-query", "ECH 查询 DoH 服务器")
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH 查询域名")
-	flag.StringVar(&routingMode, "routing", "global", "分流模式: global(全局代理), bypass_cn(跳过中国大陆), none(不改变代理)")
+	flag.StringVar(&routingMode, "routing", "global", "分流模式: global(全局代理), bypass_cn(中国域名直连，其余走代理), none(不改变代理)")
+	flag.StringVar(&enableECHFlag, "enable_ech", "y", "是否启用 ECH: y=开启(默认), n=关闭")
+}
+
+// parseEnableECH 解析 -enable_ech 参数（y=开启, n=关闭，默认开启）
+func parseEnableECH(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "n", "no", "false", "0", "off":
+		return false
+	case "y", "yes", "true", "1", "on", "":
+		return true
+	default:
+		log.Printf("[警告] 未知的 enable_ech 值: %q，默认开启 ECH", v)
+		return true
+	}
 }
 
 func main() {
 	flag.Parse()
 
+	enableECH = parseEnableECH(enableECHFlag)
+
 	if serverAddr == "" {
 		log.Fatal("必须指定服务端地址 -f\n\n示例:\n  ./client -l 127.0.0.1:1080 -f your-worker.workers.dev:443 -token your-token")
 	}
 
-	log.Printf("[启动] 正在获取 ECH 配置...")
-	if err := prepareECH(); err != nil {
-		log.Fatalf("[启动] 获取 ECH 配置失败: %v", err)
+	if enableECH {
+		log.Printf("[启动] 正在获取 ECH 配置...")
+		if err := prepareECH(); err != nil {
+			log.Fatalf("[启动] 获取 ECH 配置失败: %v", err)
+		}
+	} else {
+		log.Printf("[启动] ECH 已禁用，使用普通 TLS 连接")
 	}
 
-	// 加载中国IP列表（如果需要）
+	// 加载中国域名/IP列表（如果需要）
 	if routingMode == "bypass_cn" {
-		log.Printf("[启动] 分流模式: 跳过中国大陆，正在加载中国IP列表...")
+		log.Printf("[启动] 分流模式: 中国域名直连，其余走代理，正在加载中国域名列表...")
+
+		if err := loadChinaDomainList(); err != nil {
+			log.Printf("[警告] 加载中国域名列表失败: %v", err)
+			log.Printf("[警告] 未加载中国域名列表，除本地域名与 .cn 外均走代理")
+		} else {
+			chinaDomainsMu.RLock()
+			domainCount := len(chinaDomains)
+			chinaDomainsMu.RUnlock()
+			log.Printf("[启动] 已加载 %d 个中国域名（.cn 域名默认直连）", domainCount)
+		}
+
 		ipv4Count := 0
 		ipv6Count := 0
 
@@ -176,9 +162,9 @@ func main() {
 		}
 
 		if ipv4Count > 0 || ipv6Count > 0 {
-			log.Printf("[启动] 已加载 %d 个中国IPv4段, %d 个中国IPv6段", ipv4Count, ipv6Count)
+			log.Printf("[启动] 已加载 %d 个中国IPv4段, %d 个中国IPv6段（用于 IP 直连目标判断）", ipv4Count, ipv6Count)
 		} else {
-			log.Printf("[警告] 未加载到任何中国IP列表，将使用默认规则")
+			log.Printf("[警告] 未加载到任何中国IP列表，IP 直连目标将走代理")
 		}
 	} else if routingMode == "global" {
 		log.Printf("[启动] 分流模式: 全局代理")
@@ -291,8 +277,8 @@ func compareIPv6(a, b [16]byte) int {
 	return 0
 }
 
-// downloadIPList 下载IP列表文件
-func downloadIPList(url, filePath string) error {
+// downloadListFile 下载IP列表文件
+func downloadListFile(url, filePath string) error {
 	log.Printf("[下载] 正在下载 IP 列表: %s", url)
 
 	client := &http.Client{
@@ -352,7 +338,7 @@ func loadChinaIPList() error {
 	// 如果需要下载，先下载文件
 	if needDownload {
 		url := "https://raw.githubusercontent.com/mayaxcn/china-ip-list/refs/heads/master/chn_ip.txt"
-		if err := downloadIPList(url, ipListFile); err != nil {
+		if err := downloadListFile(url, ipListFile); err != nil {
 			return fmt.Errorf("自动下载 IPv4 列表失败: %w", err)
 		}
 	}
@@ -437,7 +423,7 @@ func loadChinaIPV6List() error {
 	// 如果需要下载，先下载文件
 	if needDownload {
 		url := "https://raw.githubusercontent.com/mayaxcn/china-ip-list/refs/heads/master/chn_ip_v6.txt"
-		if err := downloadIPList(url, ipListFile); err != nil {
+		if err := downloadListFile(url, ipListFile); err != nil {
 			log.Printf("[警告] 自动下载 IPv6 列表失败: %v，将跳过 IPv6 支持", err)
 			return nil // IPv6 列表下载失败不算致命错误
 		}
@@ -508,6 +494,148 @@ func loadChinaIPV6List() error {
 	return nil
 }
 
+// loadChinaDomainList 从程序目录加载中国域名列表
+func loadChinaDomainList() error {
+	// 获取可执行文件所在目录
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("获取可执行文件路径失败: %w", err)
+	}
+	exeDir := filepath.Dir(exePath)
+	listFile := filepath.Join(exeDir, "chn_domain.txt")
+
+	// 如果文件不存在，尝试当前目录
+	if _, err := os.Stat(listFile); os.IsNotExist(err) {
+		listFile = "chn_domain.txt"
+	}
+
+	// 检查文件是否存在或为空
+	needDownload := false
+	if info, err := os.Stat(listFile); os.IsNotExist(err) {
+		needDownload = true
+		log.Printf("[加载] 域名列表文件不存在，将自动下载")
+	} else if info.Size() == 0 {
+		needDownload = true
+		log.Printf("[加载] 域名列表文件为空，将自动下载")
+	}
+
+	// 如果需要下载，先下载文件（优先后用可用的 CDN 镜像）
+	if needDownload {
+		urls := []string{
+			"https://fastly.jsdelivr.net/gh/felixonmars/dnsmasq-china-list@master/accelerated-domains.china.conf",
+			"https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf",
+		}
+		var lastErr error
+		downloaded := false
+		for _, url := range urls {
+			if err := downloadListFile(url, listFile); err != nil {
+				lastErr = err
+				continue
+			}
+			downloaded = true
+			break
+		}
+		if !downloaded {
+			return fmt.Errorf("自动下载域名列表失败: %w", lastErr)
+		}
+	}
+
+	file, err := os.Open(listFile)
+	if err != nil {
+		return fmt.Errorf("打开域名列表文件失败: %w", err)
+	}
+	defer file.Close()
+
+	domains := make(map[string]struct{}, 131072)
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 64*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		var domain string
+		if strings.HasPrefix(line, "server=/") {
+			// dnsmasq 格式: server=/example.com/114.114.114.114
+			rest := strings.TrimPrefix(line, "server=/")
+			if i := strings.IndexByte(rest, '/'); i > 0 {
+				domain = rest[:i]
+			}
+		} else if !strings.HasPrefix(line, "server=") && !strings.ContainsAny(line, " \t") {
+			// 兼容每行一个域名的格式
+			domain = line
+		}
+
+		domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
+		if domain == "" || !strings.Contains(domain, ".") {
+			continue
+		}
+		domains[domain] = struct{}{}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("读取域名列表文件失败: %w", err)
+	}
+
+	if len(domains) == 0 {
+		return errors.New("域名列表为空")
+	}
+
+	chinaDomainsMu.Lock()
+	chinaDomains = domains
+	chinaDomainsMu.Unlock()
+
+	return nil
+}
+
+// isChinaDomain 检查域名是否属于中国域名（含 .cn、本地域名及其子域名）
+func isChinaDomain(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	host = strings.TrimSuffix(host, ".")
+	if host == "" {
+		return false
+	}
+
+	// 本机/局域网域名始终直连
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") ||
+		strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".lan") {
+		return true
+	}
+
+	// .cn 与 .中国 域名一律直连
+	if strings.HasSuffix(host, ".cn") || strings.HasSuffix(host, ".xn--fiqs8s") {
+		return true
+	}
+
+	chinaDomainsMu.RLock()
+	defer chinaDomainsMu.RUnlock()
+	if len(chinaDomains) == 0 {
+		return false
+	}
+
+	// 逐级匹配父域名（覆盖子域名），不匹配裸顶级域
+	for {
+		if _, ok := chinaDomains[host]; ok {
+			return true
+		}
+		i := strings.IndexByte(host, '.')
+		if i < 0 {
+			return false
+		}
+		host = host[i+1:]
+		if !strings.Contains(host, ".") {
+			return false
+		}
+	}
+}
+
+// isLocalIP 判断是否为本机/内网/链路本地地址
+func isLocalIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
 // shouldBypassProxy 根据分流模式判断是否应该绕过代理（直连）
 func shouldBypassProxy(targetHost string) bool {
 	if routingMode == "none" {
@@ -519,25 +647,15 @@ func shouldBypassProxy(targetHost string) bool {
 		return false
 	}
 	if routingMode == "bypass_cn" {
-		// "跳过中国大陆"模式：检查是否是中国IP
-		// 先尝试解析为IP
+		// 中国域名直连，其余域名走代理
 		if ip := net.ParseIP(targetHost); ip != nil {
-			return isChinaIP(targetHost)
-		}
-		// 如果是域名，通过缓存解析IP（避免每个请求重复同步查询DNS）
-		ips := lookupIPWithCache(targetHost)
-		if ips == nil {
-			// 解析失败，默认走代理
-			return false
-		}
-		// 检查所有解析到的IP，如果有一个是中国IP，就直连
-		for _, ip := range ips {
-			if isChinaIP(ip.String()) {
+			// IP 目标：本机/内网直连，其余回退到中国 IP 列表判断
+			if isLocalIP(ip) {
 				return true
 			}
+			return isChinaIP(targetHost)
 		}
-		// 都不是中国IP，走代理
-		return false
+		return isChinaDomain(targetHost)
 	}
 	// 未知模式，默认走代理
 	return false
@@ -616,15 +734,19 @@ func buildTLSConfigWithECH(serverName string, echList []byte) (*tls.Config, erro
 		return nil, fmt.Errorf("加载系统根证书失败: %w", err)
 	}
 
-	if echList == nil || len(echList) == 0 {
-		return nil, errors.New("ECH 配置为空，这是必需功能")
-	}
-
 	config := &tls.Config{
 		MinVersion:         tls.VersionTLS13,
 		ServerName:         serverName,
 		RootCAs:            roots,
 		ClientSessionCache: tlsSessionCache,
+	}
+
+	if !enableECH {
+		return config, nil
+	}
+
+	if len(echList) == 0 {
+		return nil, errors.New("ECH 配置为空，这是必需功能")
 	}
 
 	// 使用反射设置 ECH 字段（ECH 是核心功能，必须设置成功）
@@ -812,9 +934,13 @@ func getDoHClient() (*http.Client, error) {
 		return b.client, nil
 	}
 
-	echBytes, err := getECHList()
-	if err != nil {
-		return nil, fmt.Errorf("获取 ECH 配置失败: %w", err)
+	var echBytes []byte
+	if enableECH {
+		var err error
+		echBytes, err = getECHList()
+		if err != nil {
+			return nil, fmt.Errorf("获取 ECH 配置失败: %w", err)
+		}
 	}
 
 	tlsCfg, err := buildTLSConfigWithECH("cloudflare-dns.com", echBytes)
@@ -916,13 +1042,17 @@ func dialWebSocketWithECH(maxRetries int) (*websocket.Conn, error) {
 	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		echBytes, echErr := getECHList()
-		if echErr != nil {
-			if attempt < maxRetries {
-				refreshECH()
-				continue
+		var echBytes []byte
+		if enableECH {
+			var echErr error
+			echBytes, echErr = getECHList()
+			if echErr != nil {
+				if attempt < maxRetries {
+					refreshECH()
+					continue
+				}
+				return nil, echErr
 			}
-			return nil, echErr
 		}
 
 		tlsCfg, tlsErr := buildTLSConfigWithECH(host, echBytes)
@@ -953,7 +1083,7 @@ func dialWebSocketWithECH(maxRetries int) (*websocket.Conn, error) {
 
 		wsConn, _, dialErr := dialer.Dial(wsURL, nil)
 		if dialErr != nil {
-			if strings.Contains(dialErr.Error(), "ECH") && attempt < maxRetries {
+			if enableECH && strings.Contains(dialErr.Error(), "ECH") && attempt < maxRetries {
 				log.Printf("[ECH] 连接失败，尝试刷新配置 (%d/%d)", attempt, maxRetries)
 				refreshECH()
 				time.Sleep(time.Second)

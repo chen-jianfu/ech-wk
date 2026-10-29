@@ -8,6 +8,7 @@ ECH Workers 客户端 - 跨平台版本 (Python + PyQt5)
 import sys
 import json
 import os
+import re
 import subprocess
 import threading
 import ipaddress
@@ -24,32 +25,83 @@ if sys.platform == 'win32':
             windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE = 0
     except:
         pass
+    
+    # 高 DPI 支持 - 必须在导入 PyQt5 之前设置
+    # 使用 PROCESS_PER_MONITOR_DPI_AWARE_V2 (Windows 10 1703+)
+    # 这支持每个监视器 DPI 感知，并启用子窗口 DPI 缩放
+    try:
+        from ctypes import windll, ctypes
+        # 尝试使用最新的 DPI 感知 API (Windows 10 1703+)
+        try:
+            # PROCESS_PER_MONITOR_DPI_AWARE_V2 = 2
+            # 这个值支持每个监视器 DPI 感知和子窗口 DPI 缩放
+            windll.shcore.SetProcessDpiAwareness(2)
+        except (AttributeError, OSError):
+            # 如果 shcore 不可用，尝试旧版 API
+            try:
+                # PROCESS_PER_MONITOR_DPI_AWARE = 2 (旧版)
+                windll.shcore.SetProcessDpiAwareness(2)
+            except:
+                # 如果都失败，使用最基础的 DPI 感知
+                try:
+                    windll.user32.SetProcessDPIAware()
+                except:
+                    pass
+    except:
+        pass
 
 # 检查 PyQt5
 try:
-    from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                                  QHBoxLayout, QLabel, QLineEdit, QPushButton,
-                                  QComboBox, QTextEdit, QCheckBox, QGroupBox,
-                                  QMessageBox, QInputDialog, QSystemTrayIcon, QMenu, QAction,
-                                  QSizePolicy)
+    from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                                  QHBoxLayout, QLabel, QLineEdit, QPushButton, 
+                                  QComboBox, QTextEdit, QCheckBox, QGroupBox, 
+                                  QMessageBox, QInputDialog, QSystemTrayIcon, QMenu, QAction)
     from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
     from PyQt5.QtGui import QIcon, QTextCursor, QPixmap, QPainter, QColor, QFont
     HAS_PYQT = True
-
+    
+    # 注册 QTextCursor 类型以避免信号槽错误
     try:
         from PyQt5.QtCore import qRegisterMetaType
         qRegisterMetaType('QTextCursor')
     except (ImportError, AttributeError):
+        # qRegisterMetaType 在某些 PyQt5 版本中可能不可用，忽略
         pass
-
+    
+    # 高 DPI 支持 - 必须在创建 QApplication 之前设置
+    # PyQt5 5.6+ 支持高 DPI 缩放
+    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    
+    # 设置环境变量以优化高 DPI 显示（Windows）
+    if sys.platform == 'win32':
+        try:
+            # 启用高 DPI 缩放
+            os.environ['QT_ENABLE_HIGHDPI_SCALING'] = '1'
+            # 设置缩放因子舍入策略（避免模糊）
+            os.environ['QT_SCALE_FACTOR_ROUNDING_POLICY'] = 'Round'
+            # 禁用自动缩放因子（让系统处理）
+            # os.environ['QT_AUTO_SCREEN_SCALE_FACTOR'] = '0'
+        except:
+            pass
 except ImportError:
     HAS_PYQT = False
     print("错误: 未安装 PyQt5")
     print("安装命令: pip3 install PyQt5")
     sys.exit(1)
 
-APP_VERSION = "1.5"
+APP_VERSION = "1.4"
 APP_TITLE = f"ECH Workers 客户端 v{APP_VERSION}"
+
+# 界面缩放参数（0.8 = 比原始设计缩小 20%，适配 1600x900 等常见分辨率）
+UI_SCALE = 0.8
+UI_FONT_MIN = 12  # 最小字号，避免文字过小
+
+def _ui(value):
+    """按界面缩放比例换算尺寸"""
+    return max(1, round(value * UI_SCALE))
 
 # 中国IP列表文件名（离线版本，放在程序目录）
 CHINA_IP_LIST_FILE = "chn_ip.txt"
@@ -62,6 +114,18 @@ def get_app_dir():
     else:
         # 开发模式或直接运行 Python 脚本
         return Path(__file__).parent.absolute()
+
+def _scale_style(style, factor, font_min=UI_FONT_MIN):
+    """按比例缩放样式表中的 px 数值（字体不低于 font_min，避免过小）"""
+    pattern = re.compile(r'(font-size:\s*)?([0-9]+(?:\.[0-9]+)?)px')
+
+    def repl(match):
+        value = float(match.group(2))
+        if match.group(1):
+            return 'font-size: %dpx' % max(font_min, round(value * factor))
+        return '%dpx' % max(1, round(value * factor))
+
+    return pattern.sub(repl, style)
 
 # 复用原有的 ConfigManager, ProcessManager, AutoStartManager
 # 从原文件导入这些类（简化版本）
@@ -125,7 +189,8 @@ class ConfigManager:
             'ip': 'saas.sin.fan',
             'dns': 'dns.alidns.com/dns-query',
             'ech': 'cloudflare-ech.com',
-            'routing_mode': 'bypass_cn'  # 默认跳过中国大陆
+            'enable_ech': True,  # 默认启用 ECH
+            'routing_mode': 'bypass_cn'  # 默认中国域名直连，其余走代理
         }
         self.servers.append(default_server)
         self.current_server_id = default_server['id']
@@ -200,6 +265,9 @@ class ProcessThread(QThread):
             cmd.extend(['-dns', self.config['dns']])
         if self.config.get('ech') and self.config['ech'] != 'cloudflare-ech.com':
             cmd.extend(['-ech', self.config['ech']])
+        # ECH 开关（默认开启，仅在关闭时传参）
+        if not self.config.get('enable_ech', True):
+            cmd.extend(['-enable_ech', 'n'])
         # 添加分流模式参数
         routing_mode = self.config.get('routing_mode', 'bypass_cn')
         if routing_mode:
@@ -358,9 +426,11 @@ class MainWindow(QMainWindow):
         """初始化界面"""
         self.setWindowTitle(APP_TITLE)
         
-        # 窗口大小（适配 1440x900 及更小屏幕）
-        base_width = 600
-        base_height = 650
+        # Windows DPI 适配：根据系统 DPI 调整窗口大小
+        # PyQt5 的 AA_EnableHighDpiScaling 会自动处理缩放
+        # 我们设置逻辑像素大小，系统会自动转换为物理像素
+        base_width = 920
+        base_height = 800
         
         # 获取可用屏幕区域（排除任务栏）
         try:
@@ -388,11 +458,9 @@ class MainWindow(QMainWindow):
                     screen_x = 0
                     screen_y = 0
             
-            # 确保窗口大小不超过可用区域
-            if base_width > screen_width:
-                base_width = screen_width - 40  # 留出边距
-            if base_height > screen_height:
-                base_height = screen_height - 40  # 留出边距，确保不遮挡任务栏
+            # 按屏幕可用区域自适应：留出边距，避免超出屏幕
+            base_width = min(base_width, screen_width - 120)
+            base_height = min(base_height, screen_height - 70)
             
             # 计算居中位置
             x = screen_x + (screen_width - base_width) // 2
@@ -418,21 +486,23 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
-        layout.setSpacing(8)
-        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(_ui(15))
+        layout.setContentsMargins(_ui(20), _ui(20), _ui(20), _ui(20))
         
-        # 服务器管理
-        server_group = QGroupBox("服务器管理")
-        server_layout = QHBoxLayout()
-        server_layout.setSpacing(8)
+        # 服务器：选择/管理 + 连接参数
+        server_group = QGroupBox("服务器")
+        server_layout = QVBoxLayout()
+        server_layout.setSpacing(_ui(12))
+        
+        server_top = QHBoxLayout()
+        server_top.setSpacing(_ui(10))
         server_label = QLabel("选择服务器:")
         server_label.setStyleSheet("font-weight: 600;")
-        server_layout.addWidget(server_label)
+        server_top.addWidget(server_label)
         self.server_combo = QComboBox()
         self.server_combo.currentIndexChanged.connect(self.on_server_changed)
-        server_layout.addWidget(self.server_combo, 1)
+        server_top.addWidget(self.server_combo, 1)
         
-        # 按钮组
         btn_new = QPushButton("新增")
         btn_new.clicked.connect(self.add_server)
         btn_save = QPushButton("保存")
@@ -441,87 +511,94 @@ class MainWindow(QMainWindow):
         btn_rename.clicked.connect(self.rename_server)
         btn_delete = QPushButton("删除")
         btn_delete.clicked.connect(self.delete_server)
+        for btn in (btn_new, btn_save, btn_rename, btn_delete):
+            server_top.addWidget(btn)
+        server_layout.addLayout(server_top)
         
-        server_layout.addWidget(btn_new)
-        server_layout.addWidget(btn_save)
-        server_layout.addWidget(btn_rename)
-        server_layout.addWidget(btn_delete)
-        server_layout.addStretch()
-        server_group.setLayout(server_layout)
-        layout.addWidget(server_group)
-        
-        # 核心配置
-        core_group = QGroupBox("核心配置")
-        core_layout = QVBoxLayout()
-        core_layout.setSpacing(8)
+        addr_row = QHBoxLayout()
+        addr_row.setSpacing(_ui(10))
         self.server_edit = QLineEdit()
         self.server_edit.setPlaceholderText("例如: your-worker.workers.dev:443")
-        core_layout.addWidget(self.create_label_edit("服务地址:", self.server_edit))
+        addr_row.addWidget(self.create_label_edit("服务地址:", self.server_edit), 1)
         self.listen_edit = QLineEdit()
         self.listen_edit.setPlaceholderText("例如: 127.0.0.1:30000")
-        core_layout.addWidget(self.create_label_edit("监听地址:", self.listen_edit))
-        core_group.setLayout(core_layout)
-        layout.addWidget(core_group)
+        addr_row.addWidget(self.create_label_edit("监听地址:", self.listen_edit), 1)
+        server_layout.addLayout(addr_row)
         
-        # 高级选项
-        advanced_group = QGroupBox("高级选项 (可选)")
-        advanced_layout = QVBoxLayout()
-        advanced_layout.setSpacing(8)
         self.token_edit = QLineEdit()
         self.token_edit.setPlaceholderText("身份验证令牌（可选）")
         self.token_edit.setEchoMode(QLineEdit.Password)
-        advanced_layout.addWidget(self.create_label_edit("身份令牌:", self.token_edit))
-        row1 = QHBoxLayout()
-        row1.setSpacing(8)
+        server_layout.addWidget(self.create_label_edit("身份令牌:", self.token_edit))
+        server_group.setLayout(server_layout)
+        layout.addWidget(server_group)
+        
+        # 高级选项：优选IP/DNS/ECH
+        advanced_group = QGroupBox("高级选项 (可选)")
+        advanced_layout = QVBoxLayout()
+        advanced_layout.setSpacing(_ui(12))
+        
+        adv_row = QHBoxLayout()
+        adv_row.setSpacing(_ui(10))
         self.ip_edit = QLineEdit()
         self.ip_edit.setPlaceholderText("例如: saas.sin.fan")
-        row1.addWidget(self.create_label_edit("优选IP或域名:", self.ip_edit))
+        adv_row.addWidget(self.create_label_edit("优选IP或域名:", self.ip_edit), 1)
         self.dns_edit = QLineEdit()
         self.dns_edit.setPlaceholderText("例如: dns.alidns.com/dns-query")
-        row1.addWidget(self.create_label_edit("DOH服务器:", self.dns_edit))
-        advanced_layout.addLayout(row1)
+        adv_row.addWidget(self.create_label_edit("DOH服务器:", self.dns_edit), 1)
+        advanced_layout.addLayout(adv_row)
+        
+        ech_row = QHBoxLayout()
+        ech_row.setSpacing(_ui(10))
         self.ech_edit = QLineEdit()
         self.ech_edit.setPlaceholderText("例如: cloudflare-ech.com")
-        advanced_layout.addWidget(self.create_label_edit("ECH域名:", self.ech_edit))
+        ech_row.addWidget(self.create_label_edit("ECH域名:", self.ech_edit), 1)
+        self.ech_check = QCheckBox("启用 ECH")
+        self.ech_check.setChecked(True)
+        self.ech_check.setToolTip("关闭后使用普通 TLS 连接（适用于服务端不支持 ECH 的场景）")
+        self.ech_check.toggled.connect(self.ech_edit.setEnabled)
+        ech_row.addWidget(self.ech_check)
+        advanced_layout.addLayout(ech_row)
         advanced_group.setLayout(advanced_layout)
         layout.addWidget(advanced_group)
         
-        # 分流设置
-        routing_group = QGroupBox("分流设置")
-        routing_layout = QHBoxLayout()
-        routing_layout.setSpacing(8)
+        # 代理设置：分流模式 + 系统代理
+        proxy_group = QGroupBox("代理设置")
+        proxy_layout = QHBoxLayout()
+        proxy_layout.setSpacing(_ui(10))
         routing_label = QLabel("代理模式:")
         routing_label.setStyleSheet("font-weight: 600;")
-        routing_layout.addWidget(routing_label)
+        proxy_layout.addWidget(routing_label)
         self.routing_combo = QComboBox()
         self.routing_combo.addItem("全局代理", "global")
-        self.routing_combo.addItem("🇨🇳 跳过中国大陆", "bypass_cn")
+        self.routing_combo.addItem("🇨🇳 中国域名直连", "bypass_cn")
         self.routing_combo.addItem("不改变代理", "none")
+        self.routing_combo.setItemData(0, "所有流量都走代理", Qt.ToolTipRole)
+        self.routing_combo.setItemData(1, "中国域名与 .cn 域名直连，其余域名走代理", Qt.ToolTipRole)
+        self.routing_combo.setItemData(2, "不改变系统代理设置（直连模式）", Qt.ToolTipRole)
         self.routing_combo.currentIndexChanged.connect(self.on_routing_changed)
-        routing_layout.addWidget(self.routing_combo, 1)
-        routing_layout.addStretch()
-        routing_group.setLayout(routing_layout)
-        layout.addWidget(routing_group)
+        proxy_layout.addWidget(self.routing_combo, 1)
+        self.proxy_btn = QPushButton("设置系统代理")
+        self.proxy_btn.clicked.connect(self.toggle_system_proxy)
+        self.proxy_btn.setEnabled(False)  # 只有启动后才能设置
+        proxy_layout.addWidget(self.proxy_btn)
+        proxy_group.setLayout(proxy_layout)
+        layout.addWidget(proxy_group)
         
-        # 控制按钮
-        control_group = QGroupBox("控制")
+        # 运行控制：启动/停止 + 开机启动 + 清空日志
+        control_group = QGroupBox("运行控制")
         control_layout = QHBoxLayout()
-        control_layout.setSpacing(8)
+        control_layout.setSpacing(_ui(10))
         self.start_btn = QPushButton("启动代理")
         self.start_btn.clicked.connect(self.start_process)
         self.stop_btn = QPushButton("停止")
         self.stop_btn.clicked.connect(self.stop_process)
         self.stop_btn.setEnabled(False)
-        self.proxy_btn = QPushButton("设置系统代理")
-        self.proxy_btn.clicked.connect(self.toggle_system_proxy)
-        self.proxy_btn.setEnabled(False)  # 只有启动后才能设置
-        self.auto_start_check = QCheckBox("开机启动")
-        self.auto_start_check.stateChanged.connect(self.on_auto_start_changed)
         control_layout.addWidget(self.start_btn)
         control_layout.addWidget(self.stop_btn)
-        control_layout.addWidget(self.proxy_btn)
-        control_layout.addWidget(self.auto_start_check)
         control_layout.addStretch()
+        self.auto_start_check = QCheckBox("开机启动")
+        self.auto_start_check.stateChanged.connect(self.on_auto_start_changed)
+        control_layout.addWidget(self.auto_start_check)
         btn_clear = QPushButton("清空日志")
         btn_clear.clicked.connect(self.clear_log)
         control_layout.addWidget(btn_clear)
@@ -531,20 +608,17 @@ class MainWindow(QMainWindow):
         # 系统代理状态
         self.system_proxy_enabled = False
         
-        # 日志
+        # 运行日志（占满剩余空间）
         log_group = QGroupBox("运行日志")
         log_layout = QVBoxLayout()
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         # 使用等宽字体，更适合日志显示
-        from PyQt5.QtGui import QFont
-        font = QFont("Consolas" if sys.platform == 'win32' else "Monaco" if sys.platform == 'darwin' else "DejaVu Sans Mono", 8)
+        font = QFont("Consolas" if sys.platform == 'win32' else "Monaco" if sys.platform == 'darwin' else "DejaVu Sans Mono", 9)
         self.log_text.setFont(font)
-        self.log_text.setMinimumHeight(200)
-        self.log_text.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         log_layout.addWidget(self.log_text)
         log_group.setLayout(log_layout)
-        layout.addWidget(log_group)
+        layout.addWidget(log_group, 1)
     
     def _create_matrix_icon(self):
         """创建黑客帝国风格图标"""
@@ -603,8 +677,8 @@ class MainWindow(QMainWindow):
         return icon
     
     def _get_modern_style(self):
-        """获取黑客帝国风格样式表"""
-        return """
+        """获取黑客帝国风格样式表（整体按 70% 缩放，窗口缩小 30%）"""
+        return _scale_style("""
         /* 主窗口样式 - 深色背景 */
         QMainWindow {
             background-color: #000000;
@@ -613,13 +687,13 @@ class MainWindow(QMainWindow):
         /* 分组框样式 - 矩阵绿色边框 */
         QGroupBox {
             font-weight: 600;
-            font-size: 12px;
+            font-size: 13px;
             color: #00ff41;
             border: 2px solid #00ff41;
-            border-radius: 6px;
-            margin-top: 6px;
-            padding-top: 8px;
-            padding-bottom: 8px;
+            border-radius: 8px;
+            margin-top: 12px;
+            padding-top: 12px;
+            padding-bottom: 12px;
             background-color: #0a0a0a;
         }
         
@@ -635,16 +709,16 @@ class MainWindow(QMainWindow):
         /* 标签样式 - 绿色文字 */
         QLabel {
             color: #00ff41;
-            font-size: 12px;
-            min-width: 80px;
+            font-size: 13px;
+            min-width: 100px;
         }
         
         /* 输入框样式 - 深色背景，绿色边框 */
         QLineEdit {
             border: 2px solid #003311;
-            border-radius: 4px;
-            padding: 4px 8px;
-            font-size: 12px;
+            border-radius: 6px;
+            padding: 8px 12px;
+            font-size: 13px;
             background-color: #0a0a0a;
             color: #00ff41;
             selection-background-color: #00ff41;
@@ -665,12 +739,12 @@ class MainWindow(QMainWindow):
         /* 下拉框样式 */
         QComboBox {
             border: 2px solid #003311;
-            border-radius: 4px;
-            padding: 4px 8px;
-            font-size: 12px;
+            border-radius: 6px;
+            padding: 8px 12px;
+            font-size: 13px;
             background-color: #0a0a0a;
             color: #00ff41;
-            min-width: 80px;
+            min-width: 150px;
         }
         
         QComboBox:hover {
@@ -690,28 +764,28 @@ class MainWindow(QMainWindow):
         
         QComboBox::drop-down {
             border: none;
-            width: 24px;
-            border-top-right-radius: 4px;
-            border-bottom-right-radius: 4px;
+            width: 30px;
+            border-top-right-radius: 6px;
+            border-bottom-right-radius: 6px;
             background-color: transparent;
         }
         
         QComboBox::down-arrow {
             image: none;
-            border-left: 4px solid transparent;
-            border-right: 4px solid transparent;
-            border-top: 5px solid #00ff41;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-top: 6px solid #00ff41;
             width: 0;
             height: 0;
         }
         
         QComboBox QAbstractItemView {
             border: 2px solid #00ff41;
-            border-radius: 4px;
+            border-radius: 6px;
             background-color: #0a0a0a;
             selection-background-color: #00ff41;
             selection-color: #000000;
-            padding: 2px;
+            padding: 4px;
             color: #00ff41;
         }
         
@@ -720,11 +794,11 @@ class MainWindow(QMainWindow):
             background-color: #003311;
             color: #00ff41;
             border: 2px solid #00ff41;
-            border-radius: 4px;
-            padding: 6px 14px;
-            font-size: 12px;
+            border-radius: 6px;
+            padding: 10px 20px;
+            font-size: 13px;
             font-weight: 600;
-            min-width: 70px;
+            min-width: 100px;
         }
         
         QPushButton:hover {
@@ -777,15 +851,15 @@ class MainWindow(QMainWindow):
         /* 复选框样式 */
         QCheckBox {
             color: #00ff41;
-            font-size: 12px;
-            spacing: 6px;
+            font-size: 13px;
+            spacing: 8px;
         }
         
         QCheckBox::indicator {
-            width: 16px;
-            height: 16px;
+            width: 20px;
+            height: 20px;
             border: 2px solid #00ff41;
-            border-radius: 3px;
+            border-radius: 4px;
             background-color: #0a0a0a;
         }
         
@@ -802,16 +876,16 @@ class MainWindow(QMainWindow):
         QCheckBox::indicator:checked::after {
             content: "✓";
             color: #000000;
-            font-size: 12px;
+            font-size: 14px;
             font-weight: bold;
         }
         
         /* 文本编辑框样式（日志） - 矩阵风格 */
         QTextEdit {
             border: 2px solid #00ff41;
-            border-radius: 4px;
-            padding: 8px;
-            font-size: 11px;
+            border-radius: 6px;
+            padding: 12px;
+            font-size: 12px;
             background-color: #000000;
             color: #00ff41;
             selection-background-color: #00ff41;
@@ -826,58 +900,58 @@ class MainWindow(QMainWindow):
         QScrollBar:vertical {
             border: none;
             background-color: #0a0a0a;
-            width: 10px;
+            width: 12px;
             margin: 0;
         }
         
-        QScrollBar:handle:vertical {
+        QScrollBar::handle:vertical {
             background-color: #003311;
             border: 1px solid #00ff41;
-            border-radius: 5px;
-            min-height: 16px;
+            border-radius: 6px;
+            min-height: 20px;
             margin: 2px;
         }
         
-        QScrollBar:handle:vertical:hover {
+        QScrollBar::handle:vertical:hover {
             background-color: #00ff41;
         }
         
-        QScrollBar:add-line:vertical, QScrollBar::sub-line:vertical {
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
             height: 0;
         }
         
         QScrollBar:horizontal {
             border: none;
             background-color: #0a0a0a;
-            height: 10px;
+            height: 12px;
             margin: 0;
         }
         
-        QScrollBar:handle:horizontal {
+        QScrollBar::handle:horizontal {
             background-color: #003311;
             border: 1px solid #00ff41;
-            border-radius: 5px;
-            min-width: 16px;
+            border-radius: 6px;
+            min-width: 20px;
             margin: 2px;
         }
         
-        QScrollBar:handle:horizontal:hover {
+        QScrollBar::handle:horizontal:hover {
             background-color: #00ff41;
         }
         
-        QScrollBar:add-line:horizontal, QScrollBar::sub-line:horizontal {
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
             width: 0;
         }
         
         /* 布局间距 */
         QVBoxLayout {
-            spacing: 8px;
+            spacing: 10px;
         }
         
         QHBoxLayout {
-            spacing: 8px;
+            spacing: 10px;
         }
-        """
+        """, UI_SCALE)
     
     def init_tray_icon(self):
         """初始化系统托盘图标"""
@@ -1113,9 +1187,9 @@ class MainWindow(QMainWindow):
         widget = QWidget()
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(_ui(10))
         label = QLabel(label_text)
-        label.setMinimumWidth(80)
+        label.setMinimumWidth(_ui(120))
         label.setStyleSheet("font-weight: 500;")
         layout.addWidget(label)
         layout.addWidget(edit_widget, 1)
@@ -1156,6 +1230,7 @@ class MainWindow(QMainWindow):
             self.ip_edit.setText(server.get('ip', ''))
             self.dns_edit.setText(server.get('dns', ''))
             self.ech_edit.setText(server.get('ech', ''))
+            self.ech_check.setChecked(server.get('enable_ech', True))
             # 加载分流模式
             routing_mode = server.get('routing_mode', 'bypass_cn')
             for i in range(self.routing_combo.count()):
@@ -1229,6 +1304,7 @@ class MainWindow(QMainWindow):
         server['ip'] = self.ip_edit.text()
         server['dns'] = self.dns_edit.text()
         server['ech'] = self.ech_edit.text()
+        server['enable_ech'] = self.ech_check.isChecked()
         
         # 保存分流模式
         routing_mode = self.routing_combo.currentData()
@@ -1269,6 +1345,7 @@ class MainWindow(QMainWindow):
                     current_server['ip'] = self.ip_edit.text()
                     current_server['dns'] = self.dns_edit.text()
                     current_server['ech'] = self.ech_edit.text()
+                    current_server['enable_ech'] = self.ech_check.isChecked()
                     # 保存分流模式
                     routing_mode = self.routing_combo.currentData()
                     if routing_mode:
@@ -1304,6 +1381,7 @@ class MainWindow(QMainWindow):
                 'ip': current.get('ip', 'saas.sin.fan') if current else 'saas.sin.fan',
                 'dns': current.get('dns', 'dns.alidns.com/dns-query') if current else 'dns.alidns.com/dns-query',
                 'ech': current.get('ech', 'cloudflare-ech.com') if current else 'cloudflare-ech.com',
+                'enable_ech': current.get('enable_ech', True) if current else True,
                 'routing_mode': current.get('routing_mode', 'bypass_cn') if current else 'bypass_cn',
                 'name': name
             }
